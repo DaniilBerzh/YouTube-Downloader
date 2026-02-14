@@ -67,7 +67,6 @@ USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
 ]
 
 # ========== ГЛАВНАЯ СТРАНИЦА ==========
@@ -79,14 +78,7 @@ def index():
         return render_template('index.html')
     except Exception as e:
         logger.error(f"❌ ОШИБКА РЕНДЕРИНГА: {str(e)}")
-        return f"""
-        <h1>Ошибка загрузки страницы</h1>
-        <p>Текст ошибки: {str(e)}</p>
-        <p>Путь к templates: {TEMPLATES_DIR}</p>
-        <p>Папка существует: {os.path.exists(TEMPLATES_DIR)}</p>
-        <p>Файл index.html существует: {os.path.exists(os.path.join(TEMPLATES_DIR, 'index.html'))}</p>
-        <p>Содержимое папки: {os.listdir(BASE_DIR) if os.path.exists(BASE_DIR) else 'папка не найдена'}</p>
-        """, 500
+        return f"Ошибка: {str(e)}", 500
 
 # ========== ПОЛУЧЕНИЕ ИНФОРМАЦИИ О ВИДЕО ==========
 @app.route('/get_video_info', methods=['POST'])
@@ -119,13 +111,21 @@ def get_video_info():
             if not info:
                 return jsonify({'success': False, 'error': 'Не удалось получить информацию'})
             
+            # Собираем форматы и сразу определяем лучшее доступное качество
             formats = []
+            available_resolutions = []
+            
             for f in info.get('formats', []):
                 height = f.get('height')
-                if height and height in [1080, 720, 480, 360]:
+                if height and height in [1080, 720, 480, 360, 240, 144]:
                     filesize = f.get('filesize') or f.get('filesize_approx', 0)
                     has_audio = f.get('acodec') != 'none'
-                    will_have_audio = has_audio or (FFMPEG_PATH and height == 1080)
+                    
+                    # Запоминаем доступные разрешения
+                    if height not in available_resolutions and has_audio:
+                        available_resolutions.append(height)
+                    
+                    will_have_audio = has_audio or (FFMPEG_PATH and height >= 720)
                     
                     formats.append({
                         'resolution': f"{height}p",
@@ -136,7 +136,13 @@ def get_video_info():
                         'will_have_audio': will_have_audio
                     })
             
+            # Сортируем по качеству (от большего к меньшему)
             formats.sort(key=lambda x: int(x['resolution'].replace('p', '')), reverse=True)
+            
+            # Определяем лучшее доступное качество с аудио
+            available_resolutions.sort(reverse=True)
+            best_resolution = available_resolutions[0] if available_resolutions else 360
+            logger.info(f"📊 Лучшее доступное качество: {best_resolution}p")
             
             duration = info.get('duration', 0)
             minutes = duration // 60
@@ -152,6 +158,7 @@ def get_video_info():
                     'author': info.get('uploader', 'Неизвестный автор'),
                     'views': format_number(info.get('view_count', 0)),
                     'formats': formats,
+                    'best_resolution': f"{best_resolution}p",
                     'ffmpeg_available': FFMPEG_PATH is not None
                 }
             }
@@ -171,33 +178,57 @@ def download_video():
         url = data.get('url')
         format_id = data.get('format_id')
         
-        if not url or not format_id:
-            return jsonify({'success': False, 'error': 'Не все данные получены'})
+        if not url:
+            return jsonify({'success': False, 'error': 'URL не указан'})
         
-        logger.info(f"▶️ Начинаю скачивание. Формат ID: {format_id}")
+        logger.info(f"▶️ Начинаю скачивание")
         
         clean_url = re.sub(r'[&?]t=\d+s?', '', url)
         download_dir = os.path.join(DOWNLOAD_FOLDER, str(int(time.time())))
         os.makedirs(download_dir, exist_ok=True)
         
+        # Получаем информацию о доступных форматах
         with yt_dlp.YoutubeDL({'quiet': True}) as ydl_info:
             info_full = ydl_info.extract_info(clean_url, download=False)
             
-            selected = None
-            for f in info_full.get('formats', []):
-                if f.get('format_id') == format_id:
-                    selected = f
-                    break
+            # Если format_id не указан или не найден, выбираем лучшее качество с аудио
+            selected_format = None
+            if format_id:
+                for f in info_full.get('formats', []):
+                    if f.get('format_id') == format_id:
+                        selected_format = f
+                        break
             
-            if not selected:
-                return jsonify({'success': False, 'error': 'Формат не найден'})
+            if not selected_format:
+                # Ищем лучшее качество с аудио
+                logger.info("🔄 Выбираю лучшее доступное качество автоматически")
+                for f in sorted(info_full.get('formats', []), 
+                               key=lambda x: x.get('height', 0), reverse=True):
+                    if f.get('height') and f.get('acodec') != 'none':
+                        selected_format = f
+                        break
+                
+                # Если ничего с аудио не нашли, берем лучшее видео (FFmpeg добавит аудио)
+                if not selected_format:
+                    for f in sorted(info_full.get('formats', []), 
+                                   key=lambda x: x.get('height', 0), reverse=True):
+                        if f.get('height'):
+                            selected_format = f
+                            break
             
-            height = selected.get('height', 720)
-            has_audio = selected.get('acodec') != 'none'
-            logger.info(f"Скачиваю: {height}p, аудио: {has_audio}")
+            if not selected_format:
+                return jsonify({'success': False, 'error': 'Нет доступных форматов'})
+            
+            height = selected_format.get('height', 720)
+            has_audio = selected_format.get('acodec') != 'none'
+            format_id = selected_format.get('format_id')
+            
+            logger.info(f"📊 Скачиваю: {height}p, аудио: {has_audio}")
         
-        if FFMPEG_PATH and height == 1080 and not has_audio:
-            format_string = 'bestvideo[height=1080][ext=mp4]+bestaudio[ext=m4a]/best[height=1080]'
+        # Определяем стратегию скачивания
+        if FFMPEG_PATH and height >= 720 and not has_audio:
+            # Для высокого качества без звука - качаем видео + аудио отдельно
+            format_string = f'bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}]'
             logger.info("🎵 Использую FFmpeg для добавления звука")
         else:
             format_string = format_id

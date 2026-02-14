@@ -11,7 +11,14 @@ import time
 import sys
 import random
 
-app = Flask(__name__)
+# Определяем пути для Render
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATES_DIR = os.path.join(BASE_DIR, 'templates')
+STATIC_DIR = os.path.join(BASE_DIR, 'static')
+
+app = Flask(__name__,
+            template_folder=TEMPLATES_DIR,
+            static_folder=STATIC_DIR)
 CORS(app)
 
 # Настройка логирования
@@ -24,22 +31,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Папка для скачивания
 DOWNLOAD_FOLDER = tempfile.mkdtemp()
 app.config['DOWNLOAD_FOLDER'] = DOWNLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB
 
 # Проверка FFmpeg
 FFMPEG_PATH = shutil.which('ffmpeg')
 if FFMPEG_PATH:
     logger.info(f"✅ FFmpeg найден: {FFMPEG_PATH}")
 else:
-    logger.warning("❌ FFmpeg не найден! 1080p будет без звука!")
+    logger.warning("❌ FFmpeg не найден! 1080p может быть без звука")
 
 # Путь к cookies
-COOKIES_FILE = os.path.join(os.path.dirname(__file__), 'cookies.txt')
+COOKIES_FILE = os.path.join(BASE_DIR, 'cookies.txt')
+
+# Список User-Agent для ротации
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+]
 
 @app.route('/')
 def index():
+    """Главная страница"""
     return render_template('index.html')
 
 @app.route('/get_video_info', methods=['POST'])
@@ -118,17 +133,16 @@ def download_video():
         if not url or not format_id:
             return jsonify({'success': False, 'error': 'Не все данные получены'})
 
-        logger.info(f"▶️ Начинаю скачивание. Запрошенный формат ID: {format_id}")
+        logger.info(f"▶️ Начинаю скачивание. Формат ID: {format_id}")
 
         clean_url = re.sub(r'[&?]t=\d+s?', '', url)
         download_dir = os.path.join(DOWNLOAD_FOLDER, str(int(time.time())))
         os.makedirs(download_dir, exist_ok=True)
 
-        # Получаем информацию о видео, чтобы понять, какие форматы есть
+        # Получаем информацию о видео
         with yt_dlp.YoutubeDL({'quiet': True}) as ydl_info:
             info_full = ydl_info.extract_info(clean_url, download=False)
             
-            # Ищем запрошенный формат
             selected = None
             for f in info_full.get('formats', []):
                 if f.get('format_id') == format_id:
@@ -136,18 +150,7 @@ def download_video():
                     break
 
             if not selected:
-                # Если запрошенный формат не найден, выбираем лучший доступный
-                logger.warning(f"Формат {format_id} не найден. Ищу альтернативу...")
-                # Ищем 1080p или 720p с аудио
-                for f in info_full.get('formats', []):
-                    if f.get('height') in [1080, 720] and f.get('acodec') != 'none':
-                        selected = f
-                        format_id = f.get('format_id')
-                        logger.info(f"Выбрана альтернатива: {f.get('height')}p (ID: {format_id})")
-                        break
-
-            if not selected:
-                return jsonify({'success': False, 'error': 'Нет подходящих форматов для скачивания'})
+                return jsonify({'success': False, 'error': 'Формат не найден'})
 
             height = selected.get('height', 720)
             has_audio = selected.get('acodec') != 'none'
@@ -155,11 +158,9 @@ def download_video():
 
         # Определяем стратегию скачивания
         if FFMPEG_PATH and height == 1080 and not has_audio:
-            # 1080p без звука -> качаем видео + аудио отдельно
             format_string = 'bestvideo[height=1080][ext=mp4]+bestaudio[ext=m4a]/best[height=1080]'
             logger.info("🎵 Использую FFmpeg для добавления звука")
         else:
-            # Есть звук или FFmpeg нет -> качаем как есть
             format_string = format_id
 
         ydl_opts = {
@@ -216,7 +217,5 @@ def format_number(num):
     return str(num)
 
 if __name__ == '__main__':
-    logger.info("🚀 Запуск сервера...")
-    if os.path.exists(COOKIES_FILE):
-        logger.info("🍪 Cookies найдены")
-    app.run(debug=True, port=5000, host='0.0.0.0')
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
